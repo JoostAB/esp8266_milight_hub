@@ -37,6 +37,12 @@
 #define MILIGHT_HUB_VERSION unknown
 #endif
 
+#ifdef ESP8266
+  #define CSN_DEFAULT_PIN 15
+#elif ESP32
+  #define CSN_DEFAULT_PIN 5
+#endif
+
 #ifndef MILIGHT_MAX_STATE_ITEMS
 #define MILIGHT_MAX_STATE_ITEMS 100
 #endif
@@ -48,7 +54,7 @@
 #define SETTINGS_FILE  "/config.json"
 #define SETTINGS_TERMINATOR '\0'
 #define ALIASES_FILE "/aliases.bin"
-#define BACKUP_FILE "_backup.bin"
+#define BACKUP_FILE "/backup.bin"
 
 #define WEB_INDEX_FILENAME "/web/index.html"
 
@@ -146,7 +152,7 @@ public:
     adminPassword(""),
     // CE and CSN pins from nrf24l01
     cePin(4),
-    csnPin(15),
+    csnPin(CSN_DEFAULT_PIN),
     resetPin(0),
     ledPin(-2),
     radioInterfaceType(nRF24),
@@ -154,7 +160,10 @@ public:
     httpRepeatFactor(1),
     listenRepeats(3),
     discoveryPort(48899),
-    simpleMqttClientStatus(false),
+    mqttTopicPattern("milight/commands/:device_id/:device_type/:group_id"),
+    mqttStateTopicPattern("milight/state/:device_id/:device_type/:group_id"),
+    mqttClientStatusTopic("milight/client_status"),
+    simpleMqttClientStatus(true),
     stateFlushInterval(10000),
     mqttStateRateLimit(500),
     mqttDebounceDelay(500),
@@ -174,6 +183,7 @@ public:
     groupStateFields(DEFAULT_GROUP_STATE_FIELDS),
     rf24ListenChannel(RF24Channel::RF24_LOW),
     packetRepeatsPerLoop(10),
+    homeAssistantDiscoveryPrefix("homeassistant/"),
     wifiMode(WifiMode::G),
     defaultTransitionPeriod(500),
     groupIdAliasNextId(0),
@@ -273,8 +283,10 @@ protected:
       JsonVariant val = obj[key];
 
       // For booleans, parse string/int
-      if constexpr (std::is_same_v<bool, T>) {
-        if (val.is<bool>()) {
+
+#ifdef ESP8266
+      if (std::is_same_v<bool, T>) {
+                  if (val.is<bool>()) {
           var = val.as<bool>();
         } else if (val.is<const char*>()) {
           var = strcmp(val.as<const char*>(), "true") == 0;
@@ -286,6 +298,22 @@ protected:
       } else {
         var = val.as<T>();
       }
+#elif ESP32
+        if (std::is_same<bool, T>::value) {
+            if (val.is<bool>()) {
+                var = val.as<bool>();
+            } else if (val.is<const char*>()) {
+                var = strcmp(val.as<const char*>(), "true") == 0;
+            } else if (val.is<int>()) {
+                var = val.as<int>() == 1;
+            } else {
+                var = false;
+            }
+        } else {
+            var = val.as<T>();
+        }
+#endif
+
     }
   }
 };

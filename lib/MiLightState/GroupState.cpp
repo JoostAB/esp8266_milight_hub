@@ -5,6 +5,7 @@
 #include <BulbId.h>
 #include <MiLightCommands.h>
 
+
 static const char* BULB_MODE_NAMES[] = {
   "white",
   "color",
@@ -1032,7 +1033,7 @@ ParsedColor GroupState::getColor() const {
 
 // build up a partial state representation based on the specified GrouipStateField array.  Used
 // to gather a subset of states (configurable in the UI) for sending to MQTT and web responses.
-void GroupState::applyState(JsonObject partialState, const BulbId& bulbId, std::vector<GroupStateField>& fields) const {
+void GroupState::applyState(JsonObject partialState, const BulbId& bulbId, const std::vector<GroupStateField>& fields) const {
   for (std::vector<GroupStateField>::const_iterator itr = fields.begin(); itr != fields.end(); ++itr) {
     applyField(partialState, bulbId, *itr);
   }

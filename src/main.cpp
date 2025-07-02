@@ -13,8 +13,6 @@
 #include <MiLightHttpServer.h>
 #include <Settings.h>
 #include <MiLightUdpServer.h>
-#include <ESP8266mDNS.h>
-#include <ESP8266SSDP.h>
 #include <MqttClient.h>
 #include <MiLightDiscoveryServer.h>
 #include <MiLightClient.h>
@@ -24,6 +22,18 @@
 #include <HomeAssistantDiscoveryClient.h>
 #include <TransitionController.h>
 #include <ProjectWifi.h>
+
+#include <ESPId.h>
+
+#ifdef ESP8266
+  #include <ESP8266mDNS.h>
+  #include <ESP8266SSDP.h>
+#elif ESP32
+  #include "ESP32SSDP.h"
+  #include <esp_wifi.h>
+  #include <SPIFFS.h>
+  #include <ESPmDNS.h>
+#endif
 
 #include <vector>
 #include <memory>
@@ -60,6 +70,10 @@ std::vector<std::shared_ptr<MiLightUdpServer>> udpServers;
  * Set up UDP servers (both v5 and v6).  Clean up old ones if necessary.
  */
 void initMilightUdpServers() {
+  if (! WiFi.isConnected()) {
+    return;
+  }
+
   udpServers.clear();
 
   for (size_t i = 0; i < settings.gatewayConfigs.size(); ++i) {
@@ -79,6 +93,15 @@ void initMilightUdpServers() {
       udpServers.push_back(std::move(server));
       udpServers[i]->begin();
     }
+  }
+
+  if (discoveryServer) {
+    delete discoveryServer;
+    discoveryServer = NULL;
+  }
+  if (settings.discoveryPort != 0) {
+    discoveryServer = new MiLightDiscoveryServer(settings);
+    discoveryServer->begin();
   }
 }
 
@@ -130,7 +153,7 @@ void onPacketSentHandler(uint8_t* packet, const MiLightRemoteConfig& config) {
     }
   }
 
-  httpServer->handlePacketSent(packet, remoteConfig);
+  httpServer->handlePacketSent(packet, remoteConfig, bulbId, result);
 }
 
 /**
@@ -257,15 +280,6 @@ void applySettings() {
 
   initMilightUdpServers();
 
-  if (discoveryServer) {
-    delete discoveryServer;
-    discoveryServer = NULL;
-  }
-  if (settings.discoveryPort != 0) {
-    discoveryServer = new MiLightDiscoveryServer(settings);
-    discoveryServer->begin();
-  }
-
   // update LED pin and operating mode
   if (ledStatus) {
     ledStatus->changePin(settings.ledPin);
@@ -273,21 +287,36 @@ void applySettings() {
   }
 
   WiFi.hostname(settings.hostname);
-
-  WiFiPhyMode_t wifiMode;
+#ifdef ESP8266
+  WiFiPhyMode_t wifiPhyMode;
+switch (settings.wifiMode) {
+  case WifiMode::B:
+    wifiPhyMode = WIFI_PHY_MODE_11B;
+    break;
+  case WifiMode::G:
+    wifiPhyMode = WIFI_PHY_MODE_11G;
+    break;
+  default:
+  case WifiMode::N:
+    wifiPhyMode = WIFI_PHY_MODE_11N;
+    break;
+}
+  WiFi.setPhyMode(wifiPhyMode);
+#elif ESP32
   switch (settings.wifiMode) {
     case WifiMode::B:
-      wifiMode = WIFI_PHY_MODE_11B;
+      esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
       break;
     case WifiMode::G:
-      wifiMode = WIFI_PHY_MODE_11G;
+      esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11G);
       break;
     default:
     case WifiMode::N:
-      wifiMode = WIFI_PHY_MODE_11N;
+      esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
       break;
   }
-  WiFi.setPhyMode(wifiMode);
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+#endif
 }
 
 /**
@@ -307,6 +336,20 @@ void wifiExtraSettingsChange() {
   settings.wifiStaticIPGateway = wifiStaticIPGateway->getValue();
   settings.wifiMode = Settings::wifiModeFromString(wifiMode->getValue());
   settings.save();
+
+  // Restart the device
+  delay(1000);
+  ESP.restart();
+}
+
+void aboutHandler(JsonDocument& json) {
+  JsonObject mqtt = json.createNestedObject(FPSTR("mqtt"));
+  mqtt[FPSTR("configured")] = (mqttClient != nullptr);
+
+  if (mqttClient) {
+    mqtt[FPSTR("connected")] = mqttClient->isConnected();
+    mqtt[FPSTR("status")] = mqttClient->getConnectionStatusString();
+  }
 }
 
 // Called when a group is deleted via the REST API.  Will publish an empty message to
@@ -335,7 +378,7 @@ void postConnectSetup() {
   SSDP.setSchemaURL("description.xml");
   SSDP.setHTTPPort(80);
   SSDP.setName("ESP8266 MiLight Gateway");
-  SSDP.setSerialNumber(ESP.getChipId());
+  SSDP.setSerialNumber(getESPId());
   SSDP.setURL("/");
   SSDP.setDeviceType("upnp:rootdevice");
   SSDP.begin();
@@ -343,6 +386,7 @@ void postConnectSetup() {
   httpServer = new MiLightHttpServer(settings, milightClient, stateStore, packetSender, radios, transitions);
   httpServer->onSettingsSaved(applySettings);
   httpServer->onGroupDeleted(onGroupDeleted);
+  httpServer->onAbout(aboutHandler);
   httpServer->on("/description.xml", HTTP_GET, []() { SSDP.schema(httpServer->client()); });
   httpServer->begin();
 
@@ -358,19 +402,30 @@ void postConnectSetup() {
       }
   );
 
+  initMilightUdpServers();
+
   Serial.printf_P(PSTR("Setup complete (version %s)\n"), QUOTE(MILIGHT_HUB_VERSION));
 }
 
 void setup() {
   Serial.begin(9600);
-  String ssid = "ESP" + String(ESP.getChipId());
+  String ssid = "ESP" + String(getESPId());
 
   // load up our persistent settings from the file system
-  ProjectFS.begin();
-  Settings::load(settings);
-  applySettings();
+  // ESP8266 doesn't support the formatOnFail parameter
+  #ifdef ESP8266
+    if (! ProjectFS.begin()) {
+      Serial.println(F("Failed to mount file system"));
+    }
+  #else
+    if (! ProjectFS.begin(true)) {
+      Serial.println(F("Failed to mount file system"));
+    }
+  #endif
 
+  Settings::load(settings);
   ESPMH_SETUP_WIFI(settings);
+  applySettings();
 
   // set up the LED status for wifi configuration
   ledStatus = new LEDStatus(settings.ledPin);
@@ -383,7 +438,12 @@ void setup() {
 
   // Allows us to have static IP config in the captive portal. Yucky pointers to pointers, just to have the settings carry through
   wifiManager = new WiFiManager();
+
+  // Setting breakAfterConfig to true causes wifiExtraSettingsChange to be called whenever config params are changed
+  // (even when connection fails or user is just changing settings and not network)
+  wifiManager->setBreakAfterConfig(true);
   wifiManager->setSaveConfigCallback(wifiExtraSettingsChange);
+
   wifiManager->setConfigPortalBlocking(false);
   wifiManager->setConnectTimeout(20);
   wifiManager->setConnectRetries(5);
